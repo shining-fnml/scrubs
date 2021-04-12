@@ -1,0 +1,610 @@
+#!/usr/bin/env perl
+# Scrubs - Scrubs Checks and Repairs Un(encrypted) Blocks Suddenly
+# Copyright (C) 2021 Shining (shining-fnml on github.com)
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+use File::Copy;
+use File::Path qw(make_path);
+use Getopt::Long;
+use IO::Prompter;
+use List::Util 'sum';
+use Pod::Usage;
+use Term::ANSIColor qw(:constants :pushpop);
+use Time::HiRes qw(gettimeofday);
+ 
+ 
+# Early prototypes - begin
+sub inspect;
+sub leave;
+sub linuxPartEntry;
+sub mount;
+sub mountpoint;
+sub rmMountpoint;
+sub selection1;
+sub selection2;
+sub selection3;
+sub systemColor;
+sub table;
+sub umount;
+# Early prototypes - end
+
+# Global variables - begin
+my %gBinaries;
+my $gRadix = basename($0);
+my $gPager = $ENV{'PAGER'} ? $ENV{'PAGER'} : 'less';
+my $gTmpMP;
+my $oImage;
+my $oLuks = 0;
+my %gOptions = ( help=>0, install=>0, man=>0, version=>0 );
+my %sizes;
+my $MAPPER = $gRadix.'-';
+# Global variables - end
+
+sub cli
+{
+	my $partition = shift;
+	my $ctrl;
+
+	while (42) {
+		my $status = 0; # 1: mounted, 2: not mounted, 3: unknown filesystem
+		my @actions;
+		my $intro = "Partition $partition->{'PartNo'} ";
+		if ($partition->{'FsType'} eq '?') {
+			push @actions, qw(mkfs.ext2 mkfs.ext3 mkfs.ext4);
+			$intro .= "has an unknown or no filesystem";
+			$status = 3;
+		}
+		elsif ($partition->{'TmpMount'} eq '') {
+			push @actions, qw(autofix check dumpe2fs manualfix mount_readonly mount_readwrite mountpoint);
+			push (@actions, 'resize2fs') if ($partition->{'State'} eq 'clean' && $partition->{'sectors'} * 512 > $partition->{'block_size'}*$partition->{'block_count'});
+			$intro .= "not mounted";
+			$intro .= " (originally on $partition->{'Mountpoint'})" if $partition->{'Mountpoint'} ne "";
+			$status = 2;
+		}
+		else {
+			push (@actions, 'mc') if ($gBinaries{'mc'});
+			$status = 1;
+			push @actions, qw(dumpe2fs unmount);
+			$intro .= "mounted on $partition->{'TmpMount'}";
+		}
+		$intro .= ". Available actions:";
+		push @actions, 'back';
+
+		my $selection = prompt $intro, -menu => \@actions, '>', -stdio;
+		if ($selection eq "back") {
+			last;
+		}
+		if ($status == 1) {
+			$ctrl = selection1 $partition, $selection;
+		}
+		elsif ($status == 2) {
+			$ctrl = selection2 $partition, $selection;
+		}
+		elsif ($status == 3) {
+			$ctrl = selection3 $partition, $selection;
+		}
+		if ($ctrl) {
+			warn(($ctrl < 0 ? "Internal" : "External program")." error\n");
+			return;
+		}
+		inspect $partition;
+	}
+}
+
+sub dissection
+{
+	my $mapperPath = shift;
+	my @acceptable = ( 0, 9 );
+	my @mapper = `fdisk -l $mapperPath`;
+	my @sharona;
+	my $error = 0;
+
+	foreach (@mapper) {
+		my $entry = {};
+		my $path = $oLuks ? $mapperPath."-part" : $mapperPath;
+
+		%{$entry} = linuxPartEntry($path, $_);
+		push (@sharona, $entry) if (%{$entry});
+	}
+	foreach (@sharona) {
+		my $start = $_->{'start'}*512;
+		my $attempts = 3;
+		my $loop;
+
+		while ($attempts--) {
+			$error = systemColor "Attaching partition $_->{'PartNo'}", "losetup -o $start $mapperPath -f --show", $loop;
+			unless ($error) {
+				$_->{'loop'} = $loop;
+				chomp $_->{'loop'};
+				inspect $_;
+				push @acceptable, int($_->{'PartNo'});
+				last;
+			}
+			sleep 1;
+		}
+		last if ($error);
+	}
+	unless ($error) {
+		table \@sharona;
+		while (42) {
+			my $partno = prompt "Select a $mapperPath partition (0 to quit, 9 to print list):", -integer => \@acceptable, -stdio;
+			if  ($partno == 0) {
+				last;
+			}
+			if ($partno == 9) {
+				table \@sharona;
+				next;
+			}
+			foreach (@sharona) {
+				if ($_->{'PartNo'} == $partno) {
+					cli $_;
+				}
+			}
+		}
+	}
+	leave(\@sharona);
+}
+
+sub greenOrRed
+{
+	my ($true, $newline) = @_;
+	my $result = $true ?  sprintf "%s", LOCALCOLOR GREEN "ok" : sprintf "%s", LOCALCOLOR RED "fail";
+
+	print "\t[$result]";
+	print "\n" if $newline;
+	return $true;
+}
+
+sub init
+{
+	$oImage = shift;
+	my $now = int(gettimeofday*1000);
+	my @output = (0..9, "A".."Z", "a".."z");
+
+	die "$oImage not existing or not writable\n" unless (-w $oImage);
+	while ($now > 61) {
+		my $remaind = $now%62;
+		$now = int($now/62);
+		$MAPPER .= $output[$remaind];
+	}
+	$gTmpMP = "/tmp/$MAPPER/";
+}
+
+sub inspect
+{
+	my $partition = shift;
+
+	system("sync");
+
+	my $file = `file -s $partition->{'loop'}`;
+	my @matches =$file =~ /^\/dev\/[a-z]+[0-9]*: Linux rev [0-9]+\.[0-9]+ ([a-z0-9]+) filesystem data/;
+	$partition->{'TmpMount'} = '' unless exists $partition->{'TmpMount'};
+	unless (@matches) {
+		warn ("Can't recognize filesystem type on partition $partition->{'PartNo'}\n");
+		warn ("$file\n");
+		$partition->{'FsType'} = '?';
+		$partition->{'State'} = '?';
+		$partition->{'Mountpoint'} = '';
+		$partition->{'block_count'} = 0;
+		$partition->{'block_size'} = 0;
+	}
+	else {
+		my @lines = `dumpe2fs $partition->{'loop'} 2>/dev/null`;
+
+		$partition->{'FsType'} = $matches[0];
+		foreach(@lines) {
+			if (my @matches = $_ =~ /Last mounted on: +(\S.*)/) {
+				$partition->{'Mountpoint'} = $matches[0] eq "<not available>" ? "" : $matches[0];
+			}
+			elsif (@matches = $_ =~ /Filesystem state: +(\S.+)/) {
+				$partition->{'State'} = $matches[0];
+			}
+			elsif (@matches = $_ =~ /Block count: +(\S\d+)/) {
+				$partition->{'block_count'} = int($matches[0]);
+			}
+			elsif (@matches = $_ =~ /Block size: +(\S\d+)/) {
+				$partition->{'block_size'} = int($matches[0]);
+			}
+		}
+	}
+}
+
+sub leave
+{
+	my $sharona = shift;
+	my $error = 0;
+
+	foreach (@$sharona) {
+		umount $_ if (exists $_->{'TmpMount'} && $_->{'TmpMount'} ne '');
+		if (exists $_->{'loop'}) {
+			systemColor "Detaching partition $_->{'PartNo'} from $_->{'loop'}", "losetup -d $_->{'loop'}";
+		}
+	}
+	if (-d $gTmpMP) {
+		print("Removing directory $gTmpMP");
+		$error = ! greenOrRed(rmdir $gTmpMP, 1);
+	}
+	if ($error) {
+		print LOCALCOLOR BOLD "warning";
+		print ": NOT attempting to close LUKS partition $MAPPER";
+	}
+	elsif ($oLuks) {
+		sleep 1;
+		systemColor("Closing LUKS partition $MAPPER", "cryptsetup luksClose $MAPPER");
+		sleep 1;
+		system("sync");
+	}
+}
+
+sub linuxPartEntry
+{
+	my ($base,$line) = @_;
+
+	chomp $line;
+	my %fdisk;
+	if (my @matches = $line =~ /^${base}([1-9]).*83 Linux$/) {
+		($fdisk{'path'}, $fdisk{'start'}, $fdisk{'end'}, $fdisk{'sectors'}, $fdisk{'size'}, $fdisk{'id'}, $fdisk{'type'}) = split / +/, $line, 7;
+		$fdisk{'PartNo'} = $matches[0];
+		# print Dumper(\%fdisk);
+	}
+	return %fdisk;
+}
+
+sub luks
+{
+	my %fdisk;
+	my $loop = "loop";
+	my $found = 0;
+	my @out = `fdisk -l $oImage`;
+	foreach (@out) {
+		%fdisk = linuxPartEntry($oImage, $_);
+		if (%fdisk && ($fdisk{'PartNo'} == $oLuks)) {
+			$found = 1;
+			last;
+		}
+	}
+	die "partition $oImage$oLuks not found\n" unless ($found);
+	my $start = $fdisk{'start'}*512;
+	unless (systemColor ("Setting main loop device", "losetup -o $start $oImage -f --show", $loop)) {
+		chomp $loop;
+		my $out =`file -s $loop`;
+		if ($out !~ /^$loop: LUKS encrypted file/) {
+			warn "$loop does not contain a LUKS file\n";
+		}
+		else {
+			system("cryptsetup luksOpen $loop $MAPPER");
+			if ($? >> 8) {
+				warn ("Cannot decrypt $loop\n");
+			}
+			else {
+				dissection "/dev/mapper/$MAPPER";
+			}
+		}
+		systemColor "Finally detaching disk image from $loop", "losetup -d $loop";
+	}
+}
+
+sub mkfs
+{
+	my ($partition,$fstype) = @_;
+	my $kB = int (($partition->{'end'} - $partition->{'start'} + 1)/2);
+
+	system("mkfs.$fstype $partition->{'loop'} $kB");
+	return $? >> 8;
+}
+
+sub mount
+{
+	my ($partition, $readonly) = @_;
+	my $exitCode = 0;
+	my $options = "";
+
+	if ($readonly) {
+		$options = "-o ro ";
+	}
+	else {
+		$partition->{'MountpointSaved'} = $partition->{'Mountpoint'};
+	}
+	mkdir $gTmpMP unless (-d $gTmpMP);
+	if ($partition->{'Mountpoint'} eq "") {
+		$partition->{'TmpMount'} = $gTmpMP . $partition->{'PartNo'};
+	}
+	else {
+		$partition->{'TmpMount'} = $partition->{'Mountpoint'};
+		$partition->{'TmpMount'} =~ tr /\//_/;
+		$partition->{'TmpMount'} = $gTmpMP . $partition->{'TmpMount'};
+	}
+	mkdir $partition->{'TmpMount'};
+	system("mount $options$partition->{'loop'} $partition->{'TmpMount'}");
+	$exitCode = $? >> 8;
+	rmMountpoint ($partition) if $exitCode;
+	return $exitCode;
+}
+
+sub mountpoint
+{
+	my $partition = shift;
+	my $invitation = $partition->{'Mountpoint'} ne "" ? "Last mounted on $partition->{'Mountpoint'}. Type the new path (or type DELETE to clean the field):" : "Set a new (old) mountpoint or leave it blank to abort:";
+	
+	my $value = prompt $invitation, -DEFAULT=>'', -must => { 'look like a valid directory path' => qr/^(DELETE$|\/[^\0]*)/};
+	return if ($value eq '');
+	$partition->{"Mountpoint"} = $value eq "DELETE" ? "" : $value;
+	system("tune2fs -M '$partition->{'Mountpoint'}' $partition->{'loop'}");
+	return $? >> 8;
+}
+
+sub rmMountpoint
+{
+	my $partition = shift;
+
+	rmdir $partition->{'TmpMount'} if (-d $partition->{'TmpMount'});
+	$partition->{'TmpMount'} = '';
+}
+
+sub selection1
+{
+	my ($partition, $selection) = @_;
+
+	if ($selection eq "dumpe2fs") {
+		system("dumpe2fs $partition->{'loop'} | $gPager");
+		return 0;
+	}
+	elsif ($selection eq "mc") {
+		system("mc $partition->{'TmpMount'} .");
+		return 0;
+	}
+	elsif ($selection eq "unmount") {
+		umount $partition;
+		return 0;
+	}
+	return -1;
+}
+
+sub selection2
+{
+	my ($partition, $selection) = @_;
+
+	if ($selection eq "autofix") {
+		system("fsck.$partition->{'FsType'} -y $partition->{'loop'}");
+		return 0;
+	}
+	elsif ($selection eq "check") {
+		system("fsck.$partition->{'FsType'} -n $partition->{'loop'}");
+		return 0;
+	}
+	elsif ($selection eq "dumpe2fs") {
+		system("dumpe2fs $partition->{'loop'} | $gPager");
+		return 0;
+	}
+	elsif ($selection eq "manualfix") {
+		system("fsck.$partition->{'FsType'} $partition->{'loop'}");
+		return 0;
+	}
+	elsif ($selection eq "resize2fs") {
+		my $fsSize = ($partition->{'block_size'} * $partition->{'block_count'})>>10;
+		my $partitionSize = $partition->{'sectors'}/2;
+		my $selection = prompt "Filesystem is ${fsSize}kB and can be extended to ${partitionSize}kB. Proceed?" , -Yes=>2;
+
+		if ($selection ne "Y") {
+			print "Not resizing\n";
+			return 0;
+		}
+		system("fsck.$partition->{'FsType'} -f $partition->{'loop'}");
+		return $? >> 8 if $?;
+
+		system("resize2fs $partition->{'loop'} ${partitionSize}k");
+		return $? >> 8;
+	}
+	return (mount $partition, 1) if ($selection eq "mount_readonly");
+	return (mount $partition, 0) if ($selection eq "mount_readwrite");
+	return (mountpoint $partition) if ($selection eq "mountpoint");
+	return -1;
+}
+
+sub selection3
+{
+	my ($partition, $selection) = @_;
+
+	return (mkfs $partition, "ext2") if ($selection eq "mkfs.ext2");
+	return (mkfs $partition, "ext3") if ($selection eq "mkfs.ext3");
+	return (mkfs $partition, "ext4") if ($selection eq "mkfs.ext4");
+	return -1;
+}
+
+sub systemColor
+{
+	my $notice = shift;
+	my $cmdline = shift;
+
+	my $running = $cmdline . " 2>/dev/null";
+	print $notice;
+	if (scalar @_ > 0) {
+		$_[0] = `$running`;
+	}
+	else {
+		system $running;
+	}
+
+	my $status = $?>>8;
+	greenOrRed !$status, !$status;
+	print "\t$status: $cmdline\n" if ($status);
+	return $status;
+}
+
+sub table
+{
+	my $sharona = shift;
+	my @legend = ('PartNo', 'FsType', "State", "Mountpoint", "TmpMount", "loop");
+
+	foreach my $column (@legend) {
+		$sizes{$column} = length $column;
+		foreach (@$sharona) {
+			my $length = length $_->{$column};
+			$sizes{$column} = $length > $sizes{$column} ? $length : $sizes{$column};
+		}
+	}
+
+	my $trail = int((`tput cols`- sum(@sizes{keys %sizes}))/(scalar keys %sizes));
+	$trail = $trail < 1 ? 1 : $trail;
+
+	my $printformat = join "", map { "%-".($sizes{$_}+$trail)."s" } @legend;
+	print LOCALCOLOR BOLD sprintf $printformat."\n", @legend;
+	foreach my $partition (@$sharona) {
+		my @fields;
+		$printformat = "";
+		foreach (@legend) {
+			push @fields, $partition->{$_};
+			my $fieldFormat = "%-".($sizes{$_}+$trail)."s";
+			if ( $_ eq "State" && $partition->{$_} =~ /error/) {
+				$fieldFormat = LOCALCOLOR RED "%-".($sizes{$_}+$trail)."s";
+			}
+			elsif ( $_ eq "State" && $partition->{$_} eq "clean") {
+				$fieldFormat = LOCALCOLOR GREEN "%-".($sizes{$_}+$trail)."s";
+			}
+			$printformat .= $fieldFormat;
+		}
+		printf $printformat."\n", @fields;
+	}
+}
+
+sub umount
+{
+	my $partition = shift;
+
+	system("umount $partition->{'TmpMount'}");
+	if (exists $partition->{'MountpointSaved'}) {
+		$partition->{'Mountpoint'} = $partition->{'MountpointSaved'};
+		system("tune2fs -M '$partition->{'Mountpoint'}' $partition->{'loop'}");
+		delete($partition->{'MountpointSaved'});
+	}
+	rmMountpoint $partition;
+}
+
+# __main__
+GetOptions ('help|?' => \$gOptions{help},
+	"luks=i"  => \$oLuks,    # numeric
+	'install' => \$gOptions{'install'},
+	'man' => \$gOptions{'man'},
+	'version' => \$gOptions{'version'},,
+	'<>' => \&init) or pod2usage(2);
+foreach('mc', 'perldoc') {
+	system("which $_ >/dev/null 2>&1");
+	$gBinaries{$_} = $? == 0;
+}
+my $exclusive = sum(@gOptions{keys %gOptions});
+pod2usage(1) if (( $exclusive > 1 || ($oLuks && !$oImage)) || (!$exclusive && !$oImage));
+if ($gOptions{'man'}) {
+	die("--man requires perl-doc package to be installed\n") unless ($gBinaries{'perldoc'});
+	pod2usage(-exitval => 0, -verbose => 2);
+}
+if ($gOptions{'version'}) {
+	print "$gRadix 1.0.0\n";
+	exit 0;
+}
+pod2usage(0) if ($gOptions{'help'});
+die "Must run as root\n" if $> != 0;
+if ($gOptions{'install'}) {
+	my $prefix = -d "/usr/local/sbin" ? "/usr/local" : "/usr";
+	my $destination = "$prefix/sbin/$gRadix";
+
+	copy ($0, $destination) or die "Installation failed: $!\n";
+	chmod 0755, ($destination);
+	$destination = "$prefix/share/man/man8";
+	make_path($destination);
+	$destination .= "/$gRadix.8";
+	system("pod2man -s 8 $0 $destination");
+
+	my $exitCode = $? >> 8;
+	die "Installation failed: $!\n" if ($exitCode);
+	warn "Can't find mc in \$PATH. You better install it.\n" unless ($gBinaries{'mc'});
+	print "Installation completed. Prefix: $prefix\n";
+	exit 0;
+}
+print ("Copyright (C) 2021 Shining (shining-fnml on github.com)\n");
+print ("This program comes with ABSOLUTELY NO WARRANTY; for details read the manual page.\n");
+print ("This is free software, and you are welcome to redistribute it under certain conditions.\n\n");
+if ($oLuks) {
+	luks();
+}
+else {
+	dissection $oImage;
+}
+print "Goodbye\n";
+ 
+__END__
+ 
+=head1 NAME
+ 
+Scrubs - Scrubs Checks and Repairs Un(encrypted) Blocks Suddenly
+ 
+=head1 SYNOPSIS
+ 
+scrubs [--luks PARTNO] imagefile
+
+or
+
+scrubs --help|--install|--man|--version
+ 
+=head1 DESCRIPTION
+ 
+B<Scrubs> is an interactive tool to check the status of the partitions found in a disk image file.
+It can create new filesystems, repair or enlarge old ones, mount them transparently through losetup(8) and perform the other common operations required in data recovery.
+B<Scrubs> will scan I<imagefile> assuming it's a disk image and can explore a loop mounted filesystem launching mc(1) (midnight commander) if found in the I<$PATH>.
+ 
+=head1 OPTIONS
+ 
+=over 8
+ 
+=item B<--help>
+ 
+Print a brief help message and exits.
+
+=item B<--install>
+ 
+Install the program and the man page in the usual paths.
+ 
+=item B<--luks PARTNO>
+ 
+Use this option if I<imagefile> contains a I<Luks> partition and this partition, once decrypted, contains a whole disk image.
+B<Scrubs> will use the unencrypted contents as disk image.
+When using this option I<imagefile> can be a block device.
+ 
+=item B<--man>
+ 
+Prints the manual page and exits.
+ 
+=item B<--version>
+ 
+Prints the program version and exists.
+ 
+=back
+
+=head1 BUGS
+
+It's not surprising that (like every program that plays with partitions and filesystems) B<scrubs> can destroy your data.
+There are no unfixed bugs at the moment, but you must be careful and backup, copy, dd(1) and everything you usually do before the beginning.
+
+=head1 COPYRIGHT
+
+Copyright 2021 Shining (shining-fnml on github.com).
+License  GPLv3+:  GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+This  is  free  software:  you  are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+=cut
