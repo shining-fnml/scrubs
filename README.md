@@ -15,6 +15,7 @@ scrubs --help|--install|--man|--version
 **Scrubs** is an interactive tool to check the status of the partitions found in a disk image file.
 It can create new filesystems, repair or enlarge old ones, mount them transparently through losetup(8) and perform the other common operations required in data recovery.
 **Scrubs** will scan _imagefile_ assuming it's a disk image and can explore a loop mounted filesystem launching mc(1) (midnight commander) if found in the _$PATH_.
+**Scrubs** deals with the filesystems of the _ext\[2-4\]_ family and _Reiser_ (<4) altough with limited operations available for this type.
 
 # OPTIONS
 

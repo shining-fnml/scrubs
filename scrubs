@@ -77,29 +77,30 @@ sub cli
 			$status = "a";
 		}
 		elsif ($partition->{'FsType'} eq 'Reiser') {
+			$status = "c";
 			if ($partition->{'TmpMount'} eq '') {
+				push @actions, qw(reiserfsck) if $gBinaries{'reiserfsck'};
 				$intro .= "not mounted";
-				push @actions, qw(manualfix mount_readonly mount_readwrite);
 				$status = "b";
 			}
-			else {
-				push (@actions, 'mc') if ($gBinaries{'mc'});
-				$status = "c";
-				push @actions, qw(unmount);
-				$intro .= "mounted on $partition->{'TmpMount'}";
+		}
+		else {
+			$status = "e";
+			push @actions, qw(dumpe2fs);
+			if ($partition->{'TmpMount'} eq '') {
+				push @actions, qw(autofix check manualfix mountpoint);
+				push (@actions, 'resize2fs') if ($partition->{'State'} eq 'clean' && $partition->{'sectors'} * 512 > $partition->{'block_size'}*$partition->{'block_count'});
+				$intro .= "not mounted";
+				$intro .= " (originally on $partition->{'Mountpoint'})" if $partition->{'Mountpoint'} ne "";
+				$status = "d";
 			}
 		}
-		elsif ($partition->{'TmpMount'} eq '') {
-			push @actions, qw(autofix check dumpe2fs manualfix mount_readonly mount_readwrite mountpoint);
-			push (@actions, 'resize2fs') if ($partition->{'State'} eq 'clean' && $partition->{'sectors'} * 512 > $partition->{'block_size'}*$partition->{'block_count'});
-			$intro .= "not mounted";
-			$intro .= " (originally on $partition->{'Mountpoint'})" if $partition->{'Mountpoint'} ne "";
-			$status = "d";
+		if ($partition->{'TmpMount'} eq '') {
+			push @actions, qw(mount_readonly mount_readwrite);
 		}
 		else {
 			push (@actions, 'mc') if ($gBinaries{'mc'});
-			$status = "e";
-			push @actions, qw(dumpe2fs unmount);
+			push @actions, qw(unmount);
 			$intro .= "mounted on $partition->{'TmpMount'}";
 		}
 		$intro .= ". Available actions:";
@@ -203,7 +204,6 @@ sub inspect
 
 	system("sync");
 	systemColor ("Detecting filesystem on $partition->{'loop'}", "file -s $partition->{'loop'}", $file);
-	warn ("debug. file: $file\n");
 
 	my @matches =$file =~ /^\/dev\/[a-z]+[0-9]*: Linux rev [0-9]+\.[0-9]+ ([a-z0-9]+) filesystem data/;
 	$partition->{'TmpMount'} = '' unless exists $partition->{'TmpMount'};
@@ -471,19 +471,19 @@ sub wrapperExt
 		system("fsck.$partition->{'FsType'} -y $partition->{'loop'}");
 		return 0;
 	}
-	elsif ($selection eq "check") {
+	if ($selection eq "check") {
 		system("fsck.$partition->{'FsType'} -n $partition->{'loop'}");
 		return 0;
 	}
-	elsif ($selection eq "dumpe2fs") {
+	if ($selection eq "dumpe2fs") {
 		system("dumpe2fs $partition->{'loop'} | $gPager");
 		return 0;
 	}
-	elsif ($selection eq "manualfix") {
+	if ($selection eq "manualfix") {
 		system("fsck.$partition->{'FsType'} $partition->{'loop'}");
 		return 0;
 	}
-	elsif ($selection eq "resize2fs") {
+	if ($selection eq "resize2fs") {
 		my $fsSize = ($partition->{'block_size'} * $partition->{'block_count'})>>10;
 		my $partitionSize = $partition->{'sectors'}/2;
 		my $selection = prompt "Filesystem is ${fsSize}kB and can be extended to ${partitionSize}kB. Proceed?" , -Yes=>2;
@@ -510,15 +510,15 @@ sub wrapperExtMounted
 
 	if ($selection eq "dumpe2fs") {
 		system("dumpe2fs $partition->{'loop'} | $gPager");
-		return 0;
+		return $?>>8;
 	}
-	elsif ($selection eq "mc") {
+	if ($selection eq "mc") {
 		system("mc $partition->{'TmpMount'} .");
-		return 0;
+		return $?>>8;
 	}
-	elsif ($selection eq "unmount") {
+	if ($selection eq "unmount") {
 		umount $partition;
-		return 0;
+		return $?>>8;
 	}
 	return -1;
 }
@@ -527,7 +527,12 @@ sub wrapperReiser
 {
 	my ($partition, $selection) = @_;
 
-	warn "wrapperReiser not yet implemented";
+	if ($selection eq "reiserfsck") {
+		system("reiserfsck $partition->{'loop'}");
+		return 0; # reiserfsck returns non 0 if aborted
+	}
+	return (mount $partition, 1) if ($selection eq "mount_readonly");
+	return (mount $partition, 0) if ($selection eq "mount_readwrite");
 	return -1;
 }
 
@@ -535,7 +540,14 @@ sub wrapperReiserMounted
 {
 	my ($partition, $selection) = @_;
 
-	warn "wrapperReiserMounted not yet implemented";
+	if ($selection eq "mc") {
+		system("mc $partition->{'TmpMount'} .");
+		return 0;
+	}
+	elsif ($selection eq "unmount") {
+		umount $partition;
+		return 0;
+	}
 	return -1;
 }
 
