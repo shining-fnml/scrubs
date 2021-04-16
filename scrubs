@@ -258,10 +258,14 @@ sub linuxPartEntry
 
 	chomp $line;
 	my %fdisk;
-	if (my @matches = $line =~ /^${base}([1-9]).*83 Linux$/) {
+	if (my @matches = $line =~ /^${base}([1-9]) \*.*83 Linux$/) {
+		($fdisk{'path'}, $fdisk{'void'}, $fdisk{'start'}, $fdisk{'end'}, $fdisk{'sectors'}, $fdisk{'size'}, $fdisk{'id'}, $fdisk{'type'}) = split / +/, $line, 8;
+		$fdisk{'PartNo'} = $matches[0];
+		print Dumper(\%fdisk);
+	}
+	elsif (@matches = $line =~ /^${base}([1-9]).*83 Linux$/) {
 		($fdisk{'path'}, $fdisk{'start'}, $fdisk{'end'}, $fdisk{'sectors'}, $fdisk{'size'}, $fdisk{'id'}, $fdisk{'type'}) = split / +/, $line, 7;
 		$fdisk{'PartNo'} = $matches[0];
-		# print Dumper(\%fdisk);
 	}
 	return %fdisk;
 }
