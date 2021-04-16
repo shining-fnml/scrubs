@@ -580,7 +580,7 @@ if ($gOptions{'man'}) {
 	pod2usage(-exitval => 0, -verbose => 2);
 }
 if ($gOptions{'version'}) {
-	print "$gRadix 1.0.0\n";
+	print "$gRadix 1.1.0\n";
 	exit 0;
 }
 pod2usage(0) if ($gOptions{'help'});
