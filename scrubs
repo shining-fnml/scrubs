@@ -31,24 +31,29 @@ use Time::HiRes qw(gettimeofday);
  
 # Early prototypes - begin
 sub inspect;
+sub inspectExt;
 sub leave;
 sub linuxPartEntry;
 sub mount;
 sub mountpoint;
 sub rmMountpoint;
-sub selection1;
-sub selection2;
-sub selection3;
 sub systemColor;
 sub table;
 sub umount;
+sub wrapperError;
+sub wrapperExt;
+sub wrapperExtMounted;
+sub wrapperReiser;
+sub wrapperReiserMounted;
+sub wrapperUnknownFs;
 # Early prototypes - end
 
 # Global variables - begin
 my %gBinaries;
 my $gRadix = basename($0);
+my $gLogFile;
 my $gPager = $ENV{'PAGER'} ? $ENV{'PAGER'} : 'less';
-my $gTmpMP;
+my $gTmpSession;
 my $oImage;
 my $oLuks = 0;
 my %gOptions = ( help=>0, install=>0, man=>0, version=>0 );
@@ -59,27 +64,41 @@ my $MAPPER = $gRadix.'-';
 sub cli
 {
 	my $partition = shift;
-	my $ctrl;
+	my %wrappers = ( "a" => \&wrapperUnknownFs, "b" => \&wrapperReiser, "c" => \&wrapperReiserMounted, "d" => \&wrapperExt, "e" => \&wrapperExtMounted, "X" => \&wrapperError );
 
 	while (42) {
-		my $status = 0; # 1: mounted, 2: not mounted, 3: unknown filesystem
+		my $status = "X";
 		my @actions;
 		my $intro = "Partition $partition->{'PartNo'} ";
+
 		if ($partition->{'FsType'} eq '?') {
 			push @actions, qw(mkfs.ext2 mkfs.ext3 mkfs.ext4);
 			$intro .= "has an unknown or no filesystem";
-			$status = 3;
+			$status = "a";
+		}
+		elsif ($partition->{'FsType'} eq 'Reiser') {
+			if ($partition->{'TmpMount'} eq '') {
+				$intro .= "not mounted";
+				push @actions, qw(manualfix mount_readonly mount_readwrite);
+				$status = "b";
+			}
+			else {
+				push (@actions, 'mc') if ($gBinaries{'mc'});
+				$status = "c";
+				push @actions, qw(unmount);
+				$intro .= "mounted on $partition->{'TmpMount'}";
+			}
 		}
 		elsif ($partition->{'TmpMount'} eq '') {
 			push @actions, qw(autofix check dumpe2fs manualfix mount_readonly mount_readwrite mountpoint);
 			push (@actions, 'resize2fs') if ($partition->{'State'} eq 'clean' && $partition->{'sectors'} * 512 > $partition->{'block_size'}*$partition->{'block_count'});
 			$intro .= "not mounted";
 			$intro .= " (originally on $partition->{'Mountpoint'})" if $partition->{'Mountpoint'} ne "";
-			$status = 2;
+			$status = "d";
 		}
 		else {
 			push (@actions, 'mc') if ($gBinaries{'mc'});
-			$status = 1;
+			$status = "e";
 			push @actions, qw(dumpe2fs unmount);
 			$intro .= "mounted on $partition->{'TmpMount'}";
 		}
@@ -87,19 +106,8 @@ sub cli
 		push @actions, 'back';
 
 		my $selection = prompt $intro, -menu => \@actions, '>', -stdio;
-		if ($selection eq "back") {
-			last;
-		}
-		if ($status == 1) {
-			$ctrl = selection1 $partition, $selection;
-		}
-		elsif ($status == 2) {
-			$ctrl = selection2 $partition, $selection;
-		}
-		elsif ($status == 3) {
-			$ctrl = selection3 $partition, $selection;
-		}
-		if ($ctrl) {
+		last if ($selection eq "back");
+		if (my $ctrl = $wrappers{$status}($partition, $selection)) {
 			warn(($ctrl < 0 ? "Internal" : "External program")." error\n");
 			return;
 		}
@@ -124,11 +132,12 @@ sub dissection
 	}
 	foreach (@sharona) {
 		my $start = $_->{'start'}*512;
-		my $attempts = 3;
+		my $sizeLimit = $_->{'sectors'}*512;
+		my $attempts = 5;
 		my $loop;
 
 		while ($attempts--) {
-			$error = systemColor "Attaching partition $_->{'PartNo'}", "losetup -o $start $mapperPath -f --show", $loop;
+			$error = systemColor "Attaching partition $_->{'PartNo'}", "losetup -v -o $start --sizelimit $sizeLimit $mapperPath -f --show", $loop;
 			unless ($error) {
 				$_->{'loop'} = $loop;
 				chomp $_->{'loop'};
@@ -136,7 +145,7 @@ sub dissection
 				push @acceptable, int($_->{'PartNo'});
 				last;
 			}
-			sleep 1;
+			sleep 3;
 		}
 		last if ($error);
 	}
@@ -183,44 +192,64 @@ sub init
 		$now = int($now/62);
 		$MAPPER .= $output[$remaind];
 	}
-	$gTmpMP = "/tmp/$MAPPER/";
+	$gTmpSession = "/tmp/$MAPPER";
+	$gLogFile = "/tmp/$MAPPER.log";
 }
 
 sub inspect
 {
 	my $partition = shift;
+	my $file;
 
 	system("sync");
+	systemColor ("Detecting filesystem on $partition->{'loop'}", "file -s $partition->{'loop'}", $file);
+	warn ("debug. file: $file\n");
 
-	my $file = `file -s $partition->{'loop'}`;
 	my @matches =$file =~ /^\/dev\/[a-z]+[0-9]*: Linux rev [0-9]+\.[0-9]+ ([a-z0-9]+) filesystem data/;
 	$partition->{'TmpMount'} = '' unless exists $partition->{'TmpMount'};
-	unless (@matches) {
+	return inspectExt($partition, $matches[0]) if @matches;
+
+	$partition->{'State'} = '?';
+	$partition->{'Mountpoint'} = '';
+	$partition->{'block_count'} = 0;
+	$partition->{'block_size'} = 0;
+	unless ($file =~ /^\/dev\/[a-z]+[0-9]*: ReiserFS V[0-3]\.[0-9]/) {
+		$partition->{'FsType'} = '?';
 		warn ("Can't recognize filesystem type on partition $partition->{'PartNo'}\n");
 		warn ("$file\n");
-		$partition->{'FsType'} = '?';
-		$partition->{'State'} = '?';
-		$partition->{'Mountpoint'} = '';
-		$partition->{'block_count'} = 0;
-		$partition->{'block_size'} = 0;
 	}
 	else {
-		my @lines = `dumpe2fs $partition->{'loop'} 2>/dev/null`;
+		$partition->{'FsType'} = 'Reiser';
+		return unless ($gBinaries{'reiserfstune'});
 
-		$partition->{'FsType'} = $matches[0];
+		my @lines = `reiserfstune $partition->{'loop'} 2>/dev/null`;
 		foreach(@lines) {
-			if (my @matches = $_ =~ /Last mounted on: +(\S.*)/) {
-				$partition->{'Mountpoint'} = $matches[0] eq "<not available>" ? "" : $matches[0];
+			if ($_ =~ /^Filesystem is clean$/) {
+				$partition->{'State'} = "clean";
+				last;
 			}
-			elsif (@matches = $_ =~ /Filesystem state: +(\S.+)/) {
-				$partition->{'State'} = $matches[0];
-			}
-			elsif (@matches = $_ =~ /Block count: +(\S\d+)/) {
-				$partition->{'block_count'} = int($matches[0]);
-			}
-			elsif (@matches = $_ =~ /Block size: +(\S\d+)/) {
-				$partition->{'block_size'} = int($matches[0]);
-			}
+		}
+	}
+}
+
+sub inspectExt
+{
+	my ($partition, $fsType) = @_;
+	my @lines = `dumpe2fs $partition->{'loop'} 2>/dev/null`;
+
+	$partition->{'FsType'} = $fsType;
+	foreach(@lines) {
+		if (my @matches = $_ =~ /Last mounted on: +(\S.*)/) {
+			$partition->{'Mountpoint'} = $matches[0] eq "<not available>" ? "" : $matches[0];
+		}
+		elsif (@matches = $_ =~ /Filesystem state: +(\S.+)/) {
+			$partition->{'State'} = $matches[0];
+		}
+		elsif (@matches = $_ =~ /Block count: +(\S\d+)/) {
+			$partition->{'block_count'} = int($matches[0]);
+		}
+		elsif (@matches = $_ =~ /Block size: +(\S\d+)/) {
+			$partition->{'block_size'} = int($matches[0]);
 		}
 	}
 }
@@ -236,9 +265,9 @@ sub leave
 			systemColor "Detaching partition $_->{'PartNo'} from $_->{'loop'}", "losetup -d $_->{'loop'}";
 		}
 	}
-	if (-d $gTmpMP) {
-		print("Removing directory $gTmpMP");
-		$error = ! greenOrRed(rmdir $gTmpMP, 1);
+	if (-d $gTmpSession) {
+		print("Removing directory $gTmpSession");
+		$error = ! greenOrRed(rmdir $gTmpSession, 1);
 	}
 	if ($error) {
 		print LOCALCOLOR BOLD "warning";
@@ -261,7 +290,7 @@ sub linuxPartEntry
 	if (my @matches = $line =~ /^${base}([1-9]) \*.*83 Linux$/) {
 		($fdisk{'path'}, $fdisk{'void'}, $fdisk{'start'}, $fdisk{'end'}, $fdisk{'sectors'}, $fdisk{'size'}, $fdisk{'id'}, $fdisk{'type'}) = split / +/, $line, 8;
 		$fdisk{'PartNo'} = $matches[0];
-		print Dumper(\%fdisk);
+		# print Dumper(\%fdisk);
 	}
 	elsif (@matches = $line =~ /^${base}([1-9]).*83 Linux$/) {
 		($fdisk{'path'}, $fdisk{'start'}, $fdisk{'end'}, $fdisk{'sectors'}, $fdisk{'size'}, $fdisk{'id'}, $fdisk{'type'}) = split / +/, $line, 7;
@@ -325,14 +354,14 @@ sub mount
 	else {
 		$partition->{'MountpointSaved'} = $partition->{'Mountpoint'};
 	}
-	mkdir $gTmpMP unless (-d $gTmpMP);
+	mkdir $gTmpSession unless (-d $gTmpSession);
 	if ($partition->{'Mountpoint'} eq "") {
-		$partition->{'TmpMount'} = $gTmpMP . $partition->{'PartNo'};
+		$partition->{'TmpMount'} = $gTmpSession . "/" . $partition->{'PartNo'};
 	}
 	else {
 		$partition->{'TmpMount'} = $partition->{'Mountpoint'};
 		$partition->{'TmpMount'} =~ tr /\//_/;
-		$partition->{'TmpMount'} = $gTmpMP . $partition->{'TmpMount'};
+		$partition->{'TmpMount'} = $gTmpSession . "/" . $partition->{'TmpMount'};
 	}
 	mkdir $partition->{'TmpMount'};
 	system("mount $options$partition->{'loop'} $partition->{'TmpMount'}");
@@ -361,83 +390,17 @@ sub rmMountpoint
 	$partition->{'TmpMount'} = '';
 }
 
-sub selection1
-{
-	my ($partition, $selection) = @_;
-
-	if ($selection eq "dumpe2fs") {
-		system("dumpe2fs $partition->{'loop'} | $gPager");
-		return 0;
-	}
-	elsif ($selection eq "mc") {
-		system("mc $partition->{'TmpMount'} .");
-		return 0;
-	}
-	elsif ($selection eq "unmount") {
-		umount $partition;
-		return 0;
-	}
-	return -1;
-}
-
-sub selection2
-{
-	my ($partition, $selection) = @_;
-
-	if ($selection eq "autofix") {
-		system("fsck.$partition->{'FsType'} -y $partition->{'loop'}");
-		return 0;
-	}
-	elsif ($selection eq "check") {
-		system("fsck.$partition->{'FsType'} -n $partition->{'loop'}");
-		return 0;
-	}
-	elsif ($selection eq "dumpe2fs") {
-		system("dumpe2fs $partition->{'loop'} | $gPager");
-		return 0;
-	}
-	elsif ($selection eq "manualfix") {
-		system("fsck.$partition->{'FsType'} $partition->{'loop'}");
-		return 0;
-	}
-	elsif ($selection eq "resize2fs") {
-		my $fsSize = ($partition->{'block_size'} * $partition->{'block_count'})>>10;
-		my $partitionSize = $partition->{'sectors'}/2;
-		my $selection = prompt "Filesystem is ${fsSize}kB and can be extended to ${partitionSize}kB. Proceed?" , -Yes=>2;
-
-		if ($selection ne "Y") {
-			print "Not resizing\n";
-			return 0;
-		}
-		system("fsck.$partition->{'FsType'} -f $partition->{'loop'}");
-		return $? >> 8 if $?;
-
-		system("resize2fs $partition->{'loop'} ${partitionSize}k");
-		return $? >> 8;
-	}
-	return (mount $partition, 1) if ($selection eq "mount_readonly");
-	return (mount $partition, 0) if ($selection eq "mount_readwrite");
-	return (mountpoint $partition) if ($selection eq "mountpoint");
-	return -1;
-}
-
-sub selection3
-{
-	my ($partition, $selection) = @_;
-
-	return (mkfs $partition, "ext2") if ($selection eq "mkfs.ext2");
-	return (mkfs $partition, "ext3") if ($selection eq "mkfs.ext3");
-	return (mkfs $partition, "ext4") if ($selection eq "mkfs.ext4");
-	return -1;
-}
-
 sub systemColor
 {
 	my $notice = shift;
 	my $cmdline = shift;
 
-	my $running = $cmdline . " 2>/dev/null";
+	open (my $fh, '>>', $gLogFile) or return -1;
+	print $fh "[$cmdline]\n";
+	close $fh;
+	my $running = $cmdline . " 2>>$gLogFile";
 	print $notice;
+	system "sync";
 	if (scalar @_ > 0) {
 		$_[0] = `$running`;
 	}
@@ -500,6 +463,93 @@ sub umount
 	rmMountpoint $partition;
 }
 
+sub wrapperExt
+{
+	my ($partition, $selection) = @_;
+
+	if ($selection eq "autofix") {
+		system("fsck.$partition->{'FsType'} -y $partition->{'loop'}");
+		return 0;
+	}
+	elsif ($selection eq "check") {
+		system("fsck.$partition->{'FsType'} -n $partition->{'loop'}");
+		return 0;
+	}
+	elsif ($selection eq "dumpe2fs") {
+		system("dumpe2fs $partition->{'loop'} | $gPager");
+		return 0;
+	}
+	elsif ($selection eq "manualfix") {
+		system("fsck.$partition->{'FsType'} $partition->{'loop'}");
+		return 0;
+	}
+	elsif ($selection eq "resize2fs") {
+		my $fsSize = ($partition->{'block_size'} * $partition->{'block_count'})>>10;
+		my $partitionSize = $partition->{'sectors'}/2;
+		my $selection = prompt "Filesystem is ${fsSize}kB and can be extended to ${partitionSize}kB. Proceed?" , -Yes=>2;
+
+		if ($selection ne "Y") {
+			print "Not resizing\n";
+			return 0;
+		}
+		system("fsck.$partition->{'FsType'} -f $partition->{'loop'}");
+		return $? >> 8 if $?;
+
+		system("resize2fs $partition->{'loop'} ${partitionSize}k");
+		return $? >> 8;
+	}
+	return (mount $partition, 1) if ($selection eq "mount_readonly");
+	return (mount $partition, 0) if ($selection eq "mount_readwrite");
+	return (mountpoint $partition) if ($selection eq "mountpoint");
+	return -1;
+}
+
+sub wrapperExtMounted
+{
+	my ($partition, $selection) = @_;
+
+	if ($selection eq "dumpe2fs") {
+		system("dumpe2fs $partition->{'loop'} | $gPager");
+		return 0;
+	}
+	elsif ($selection eq "mc") {
+		system("mc $partition->{'TmpMount'} .");
+		return 0;
+	}
+	elsif ($selection eq "unmount") {
+		umount $partition;
+		return 0;
+	}
+	return -1;
+}
+
+sub wrapperReiser
+{
+	my ($partition, $selection) = @_;
+
+	warn "wrapperReiser not yet implemented";
+	return -1;
+}
+
+sub wrapperReiserMounted
+{
+	my ($partition, $selection) = @_;
+
+	warn "wrapperReiserMounted not yet implemented";
+	return -1;
+}
+
+sub wrapperUnknownFs
+{
+	# unknown fs
+	my ($partition, $selection) = @_;
+
+	return (mkfs $partition, "ext2") if ($selection eq "mkfs.ext2");
+	return (mkfs $partition, "ext3") if ($selection eq "mkfs.ext3");
+	return (mkfs $partition, "ext4") if ($selection eq "mkfs.ext4");
+	return -1;
+}
+
 # __main__
 GetOptions ('help|?' => \$gOptions{help},
 	"luks=i"  => \$oLuks,    # numeric
@@ -507,7 +557,7 @@ GetOptions ('help|?' => \$gOptions{help},
 	'man' => \$gOptions{'man'},
 	'version' => \$gOptions{'version'},,
 	'<>' => \&init) or pod2usage(2);
-foreach('mc', 'perldoc') {
+foreach('mc', 'perldoc', 'reiserfsck', 'reiserfstune', 'resize_reiserfs') {
 	system("which $_ >/dev/null 2>&1");
 	$gBinaries{$_} = $? == 0;
 }
@@ -543,13 +593,14 @@ if ($gOptions{'install'}) {
 print ("Copyright (C) 2021 Shining (shining-fnml on github.com)\n");
 print ("This program comes with ABSOLUTELY NO WARRANTY; for details read the manual page.\n");
 print ("This is free software, and you are welcome to redistribute it under certain conditions.\n\n");
+print ("Logging operations in $gLogFile\n");
 if ($oLuks) {
 	luks();
 }
 else {
 	dissection $oImage;
 }
-print "Goodbye\n";
+print "Operations logged in $gTmpSession.log\n";
  
 __END__
  
@@ -570,6 +621,7 @@ scrubs --help|--install|--man|--version
 B<Scrubs> is an interactive tool to check the status of the partitions found in a disk image file.
 It can create new filesystems, repair or enlarge old ones, mount them transparently through losetup(8) and perform the other common operations required in data recovery.
 B<Scrubs> will scan I<imagefile> assuming it's a disk image and can explore a loop mounted filesystem launching mc(1) (midnight commander) if found in the I<$PATH>.
+B<Scrubs> deals with the filesystems of the I<ext[2-4]> family and I<Reiser> (<4) altough with limited operations available for this type.
  
 =head1 OPTIONS
  
